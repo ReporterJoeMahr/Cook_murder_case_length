@@ -1,0 +1,282 @@
+# How long are murder cases taking in Cook County?
+## by Joe Mahr/ Chicago Tribune
+
+```{r setup, echo=T, error=F, results=F, message=F, warning=F}
+library(knitr)
+opts_chunk$set(out.width="900px", dpi=300)
+```
+
+This analysis uses [R](https://www.r-project.org/) code, with source data from the Cook County State's Attorney's office which is updated several times a year. (Here's a [nice primer](https://www.cookcountystatesattorney.org/about/open-data) on its data.) This analysis uses data published by that office on 1/23/2023. If you run this code with future files, you should expect different results.
+
+### **Getting the data**
+
+One option is download these three files:   
+-SA_dispositions *(Updated data [here](https://datacatalog.cookcountyil.gov/api/views/apwk-dzx8/rows.csv?accessType=DOWNLOAD).)*   
+-SA_initiations *(Updated data [here](https://datacatalog.cookcountyil.gov/api/views/7mck-ehwz/rows.csv?accessType=DOWNLOAD).)*   
+-SA_sentencings *(Updated data [here](https://datacatalog.cookcountyil.gov/api/views/tg8v-tm6u/rows.csv?accessType=DOWNLOAD).)*
+
+Another option is to grab them from my [Google Drive file](https://drive.google.com/drive/folders/1oP5FXeJV98sO1oUkh1UHbMIj2mb1nKga?usp=sharing).
+
+Either way, you'll want to create a folder called raw_data, in your working directory, and save them there. 
+
+The key file is the dispositions file. It has unique IDs for each case and each participant in each case. And it offers, among other things, a date each case was disposed and a date of each subject's arrest. (Comparing the two will tell you how long each case took.) Of course, like most datasets, it's not perfect. A sliver of disposition records were missing arrest dates. To try to correct for that, I looked for arrest dates for these cases in the other two datasets, which also chronicled some aspects of each case (including, in theory, an arrest date). Unfortunately, those datasets also were missing arrest dates for this sliver of cases. Still, I've included that double-check code anyway, in case it's helpful for others pursuing this kind of research in the future.
+
+```{r loading, warning=F, message=F, results=F}
+
+# List of packages for session
+.packages = c("ggplot2", "tidyverse", "lubridate", "DT")
+
+# Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+
+
+#Here is our raw data, which we pull from our working directory:
+SA_dispositions <- read_csv("raw_data/SA_dispositions.csv",show_col_types = FALSE)
+SA_initiations <- read_csv("raw_data/SA_initiations.csv",show_col_types = FALSE)
+SA_sentencings <- read_csv("raw_data/SA_sentencings.csv",show_col_types = FALSE)
+
+```
+
+### **Preparing the data**
+
+I limited the Dispositions file to all cases on or before 
+Dec. 31, 2022, and I created two date fields: a date of disposition and an arrest date. 
+
+```{r, results=F, message=F, warning=F}
+SA_dispositions_thru_20221231 <- SA_dispositions %>% 
+  mutate(DISPOSITION_DATE=as.Date(mdy_hms(DISPOSITION_DATE))) %>% 
+  mutate(ARREST_DATE=as.Date(mdy_hms(ARREST_DATE))) %>% 
+  filter(DISPOSITION_DATE<="2022-12-31")
+```
+
+One tricky part of this is that each line is a charge in a case, but a case can have multiple charges (particularly as the allegations get more serious). Sometimes, some charges against a case participant are disposed of earlier than other charges. Because of that, I had to decide *when* a case was truly disposed. Here's my logic:  
+-If someone was found guilty of anything, the case disposition date is the *first* date that the person was found guilty of anything. That's because, on that date, the person's status switched from being accused but not convicted of anything, to being convicted of some level of wrongdoing related to the case.  
+-If someone was not found guilty of any charge, the disposition date is the date that the *last* charge was disposed. That's because, on that date, the person left the court no longer formally accused of any wrongdoing.  
+This analysis follows the common convention of only measuring the days to get to a result of guilt or innocence, and does not include any delays in sentencing someone found guilty.
+
+And one side note: This analysis does not include cases where the primary charge was second-degree murder or conspiracy to commit murder. That's because those charges are considered lower-tier felonies than traditional murder charges (such as first-degree murder), and the prosecutors' data categorizes them separate of traditional murder charges.
+
+```{r, results=F, message=F, warning=F}
+
+#This will determine cases in which the accused was found guilty of something, and then take EARLIEST disposition date of these cases:
+
+murder_cases_participants_guilty <- SA_dispositions_thru_20221231 %>% 
+  #This filters for murder cases:
+  filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #This slims to just ID info...
+  select(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  distinct() %>% 
+  #...so we can link it back to include ANY charges tied to a Class M murder case:
+  left_join(SA_dispositions_thru_20221231) %>% 
+  #This lists all the possible ways murder cases end in a guilt finding:
+  filter(CHARGE_DISPOSITION=="Plea of Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Plea Of Guilty"|
+         CHARGE_DISPOSITION=="Finding Guilty"|
+         CHARGE_DISPOSITION=="Verdict Guilty"|
+         CHARGE_DISPOSITION=="Finding Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Plea of Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Finding Guilty But Mentally Ill"|
+         CHARGE_DISPOSITION=="Verdict Guilty - Lesser Included"|
+         CHARGE_DISPOSITION=="Plea of Guilty But Mentally Ill"|
+         CHARGE_DISPOSITION=="Verdict Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Finding Guilty - Amended Charge"|
+         CHARGE_DISPOSITION=="Plea of Guilty But Mentally Ill") %>% 
+  #Now that we've narrowed to just those guilty ones, let's find earliest disposition date:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,ARREST_DATE) %>% 
+  group_by(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  summarize(DISPOSITION_DATE=min(DISPOSITION_DATE),
+            ARREST_DATE=min(ARREST_DATE)) %>% 
+  #This creates a category that we'll use later during an append operation:
+  mutate(RESULT="Guilty") 
+```
+
+Once I had determined who'd been found guilty of anything, I determined the disposition date for the other group: those who walked away from a case without being found guilty of anything.
+
+```{r, results=F, message=F, warning=F}
+
+#This will take LATEST disposition date of the remaining cases:
+
+murder_cases_participants_not_guilty <- SA_dispositions_thru_20221231 %>% 
+  #Again, filtering for murder cases
+  filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #Now, asking for every case/participant NOT included in our dataframe of guilty participants 
+  anti_join(murder_cases_participants_guilty, by=c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+filter(DISPOSITION_CHARGED_CLASS=="M") %>% 
+  #This slims to just ID info...
+  select(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  distinct() %>% 
+  #...so we can link it back to include ANY charges of a non-guilty Class M murder case:
+  left_join(SA_dispositions_thru_20221231) %>% 
+  #Now that we've narrowed to not guilty ones, let's find latest disposition date:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,ARREST_DATE) %>% 
+  group_by(CASE_ID,CASE_PARTICIPANT_ID) %>% 
+  summarize(DISPOSITION_DATE=max(DISPOSITION_DATE),
+            ARREST_DATE=min(ARREST_DATE)) %>% 
+  #Again, creating a category that we'll use later during an append operation:
+  mutate(RESULT="Not Guilty")
+```
+
+I was left with two datasets: one of those guilty of something, the other of those not guilty of everything. I combined them into one dataset.
+
+```{r, results=F, message=F, warning=F}  
+
+#This combines both sets of data:
+
+murder_defendants_dispositions_all <- rbind(murder_cases_participants_not_guilty,
+                                    murder_cases_participants_guilty) %>% 
+  #This eliminates any cases that don't have a disposition date. The good news is that all 2,281 cases in this data drop list a disposition date. But this next line is here just in case, as a safety to avoid pitfalls in later steps.
+  filter(!is.na(DISPOSITION_DATE)) 
+
+```
+
+While all the listed cases had disposition dates, I found one problem: 27 of 2,281 did not list an arrest date (1.2% of them). We need an arrest date to figure out how long a case took. That's why I brought in the other two datasets, on the chance I could grab a missing arrest date from one of those other datasets, to limit the number of cases I had to exclude from the analysis. Ultimately, I could not link any of those 27 with an arrest date in another dataset. But I'm including the code below, even though it's a bit of a long walk to get there.
+
+
+```{r, results=F, message=F, warning=F}
+
+#This finds the cases missing an arrest date
+murder_defendants_dispositions_missing_arrest_dates <- murder_defendants_dispositions_all %>% 
+  filter(is.na(ARREST_DATE))
+
+#This searches for any arrest dates in the initiations file:
+
+SA_initiations_with_missing_arrest_dates <- murder_defendants_dispositions_missing_arrest_dates %>% 
+  #This gets rid of the field that's missing values
+  select(-ARREST_DATE) %>% 
+  left_join(SA_initiations, by=c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+  #This cleans up the file to only include the fields we care about:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,ARREST_DATE,RESULT) %>% 
+  #This filters out for any cases that have an arrest date, and eliminates duplicates:
+  filter(!is.na(ARREST_DATE)) %>% 
+  distinct() %>% 
+  #This ensures the proper format of any lines wtih an arrest date
+  mutate(ARREST_DATE=as.Date(mdy_hms(ARREST_DATE))) %>% 
+  distinct()
+
+#This searches for any arrest dates in the sentencings file:
+
+SA_sentencings_with_missing_arrest_dates <- murder_defendants_dispositions_missing_arrest_dates %>% 
+  #This gets rid of the field that's missing values
+  select(-ARREST_DATE) %>% 
+  left_join(SA_sentencings, by=c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+  #This cleans up the file to only include the fields we care about (but note the change in disposition_date because of duplicate field name in join:
+  select(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE.x,ARREST_DATE,RESULT) %>% 
+  #This cleans up that disposition date name issue:
+  rename(DISPOSITION_DATE=DISPOSITION_DATE.x) %>% 
+  #This filters out for any cases that have an arrest date, and eliminates duplicates:
+  filter(!is.na(ARREST_DATE)) %>% 
+  distinct() %>% 
+  #This ensures the proper format of any lines wtih an arrest date
+  mutate(ARREST_DATE=as.Date(mdy_hms(ARREST_DATE))) %>% 
+  distinct()
+
+#This combines any arrests we can use from these other datasets:
+
+SA_initiations_sentencings_with_missing_arrest_dates <- rbind(SA_initiations_with_missing_arrest_dates,
+                                                              SA_sentencings_with_missing_arrest_dates) %>% 
+  #This cleans it up in case both datasets had same new arrest date:
+  distinct() %>% 
+  #This cleans it up in case datasets had different arrest dates for the same case, with us choosing to go with latest arrest date to be conservative in analysisof delays:
+  group_by(CASE_ID,CASE_PARTICIPANT_ID,DISPOSITION_DATE,RESULT) %>% 
+  summarize(ARREST_DATE=min(ARREST_DATE))
+
+#This adds any additional dispositions we can use to our original list
+
+murder_defendants_dispositions_fixed <-
+  #This sets the table by limiting our initial list to just cases with arrest dates
+  murder_defendants_dispositions_all %>% 
+  filter(!is.na(ARREST_DATE)) %>% 
+  #This brings in the additional usable cases with arrest dates culled from other datasets:
+  rbind(SA_initiations_sentencings_with_missing_arrest_dates)
+
+#The cleaned dataset is also saved to Cleaned_data folder
+
+```
+
+I ended up with **2,254** murder dispositions on or before 12/31/2022 with an arrest date and a disposition date.
+
+The cleaned dataset looked like this:
+
+```{r, message=FALSE}
+
+#If you want to save time, you can start here to upload cleaned_data file, but noting out for now:
+#murder_defendants_dispositions_fixed <- read_csv("Cleaned_data/murder_defendants_dispositions_fixed.csv")
+
+#This prepares to show as a chart:
+cleaned_data<- murder_defendants_dispositions_fixed %>% 
+  filter(row_number()<100)
+
+datatable(cleaned_data, extensions = 'Buttons', options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+### **Analyzing the data**
+
+My next step was computing the number of days it took to dispose each murder case for which we had enough data, for each year. I also had to add two final clean-up measures here. One is eliminating any cases where the listed arrest happened after the listed disposition, seeing as that's mathematically impossible. The other -- more of a judgment call -- tries to eliminate cases in which the address date is inconceivably too distant in the past to be accurate. The data suggests some cases lasted up to 26 years, which is something we haven't seen in the reporting. As of 2022, separate lists kept by the sheriff show one inmate in custody more than 12 years. So, to try to be conservative but also not erroneously exclude cases that may have lasted a long time, I eliminated cases where disposition times were indicated to have been longer than 13 years. Both steps bring the number of measurable cases down to **2,199** cases.
+
+
+```{r, message=FALSE}
+murder_defendants_dispositions_time <- murder_defendants_dispositions_fixed %>% 
+  mutate(Disp_year=year(DISPOSITION_DATE)) %>% 
+  mutate(Disp_days=difftime(DISPOSITION_DATE,ARREST_DATE)) %>% 
+  #This eliminates any rows where the arrest was listed as occurring after the disposition:
+  filter(Disp_days>=0) %>% 
+  #This eliminates any rows where the disposition was listed as occurring more than 13 years after the arrest:
+  filter((Disp_days/365.25)<=13)
+```
+
+The next step was computing medians for each year.
+
+```{r, message=FALSE}
+murder_defendants_dispositions_time_stats_median <- murder_defendants_dispositions_time %>% 
+  select(Disp_year,Disp_days) %>% 
+  group_by(Disp_year) %>% 
+  summarize(Number_cases=n(),
+            Median_days=median(Disp_days))
+
+kable(murder_defendants_dispositions_time_stats_median)
+
+#A version of this is saved in the Final_data folder
+
+
+
+```
+But another way to see what this looks like is through a bar chart, like this, with the days converted to years:
+
+
+```{r, message=FALSE}
+
+#This determines our median (half longer/ half shorter) disposition times, by year of case disposed:
+murder_defendants_dispositions_time_stats_median <- murder_defendants_dispositions_time %>% 
+  select(Disp_year,Disp_days) %>% 
+  group_by(Disp_year) %>% 
+  summarize(count=n(),
+            Disp_days=as.numeric(median(Disp_days))) %>% 
+  #This converts to years, using avg days in year of 365.25
+  mutate(Median_years=round(Disp_days/365.25,1))
+
+murder_defendants_dispositions_time_median_years <- murder_defendants_dispositions_time_stats_median %>% 
+  #This renames some columns
+  rename(Year_of_Disposition=Disp_year,
+         Median_Years_to_Dispose=Median_years) %>% 
+  select(Year_of_Disposition,Median_Years_to_Dispose)
+
+#A completed copy of this data is found in the Final_data file
+
+#This plots the data:
+
+ggplot(murder_defendants_dispositions_time_median_years, aes(x=Year_of_Disposition, y=Median_Years_to_Dispose)) + 
+  geom_col() +
+  scale_x_continuous(limits = c(2010, 2023), breaks = seq(2011, 2022, 1)) +
+  geom_text(aes(label=Median_Years_to_Dispose),vjust=-0.2,color="red")
+
+
+```
+
